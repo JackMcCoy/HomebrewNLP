@@ -17,6 +17,16 @@ def serialize(instance: typing.Union[DataClass, typing.Dict[str, typing.Any]]):
         return serialize({key: value for key, value in attributes.items() if not isinstance(value, typing.Callable)})
     return {k: serialize(v) if isinstance(v, DataClass) else v for k, v in instance.items()}
 
+class PKM(DataClass):
+    use_pkm: bool = False
+    topk: int = 32
+    input_dropout: float = 0.0
+    query_dropout: float = 0.0
+    value_dropout: float = 0.0
+    pkm_layer_depths: typing.List[int] = [4, 7]
+    heads: int = 4
+    dim_head: int = 256
+    num_keys: int = 128
 
 class Model(DataClass):
     weight_sharing: bool = False

@@ -1,5 +1,6 @@
 import copy
 import typing
+import math
 
 import numpy as np
 import revlib
@@ -28,10 +29,17 @@ def orthonormal(inp: typing.Union[torch.Tensor, torch.nn.Parameter, typing.List[
         return torch.nn.Parameter(inp)
     return original_input
 
+def init_(t, dim = None):
+    dim = dim if dim is not None else t.shape[-1]
+    std = 1. / math.sqrt(dim)
+    return torch.nn.init.normal_(t, mean=0, std=std)
+
 
 class TripleNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, scale0: torch.Tensor, scale1: torch.Tensor, shift: torch.Tensor, norm_power: int):
+        # linear_attention chunk names:
+        #   scale0 = depth, scale1 = scale, shift = shift
         scale0_relu = scale0.relu()
         inp = scale0_relu.pow(3) * scale1 + shift
         inp = inp - inp.mean(1, True)
@@ -89,10 +97,11 @@ def moe(inp: torch.Tensor, expert_weights: torch.nn.ParameterList, training: boo
     input_fp32 = inp.float()
     if training:
         input_fp32 = input_fp32 * (torch.rand_like(input_fp32) * jitter_epsilon + 1)
+    #matrix multiplication to find tokens' most similar expert
     logits = input_fp32.mm(gate)
     gates = F.softmax(logits, dim=1)
 
-    # calculate permutation
+    # calculate permutation/ assign experts
     with torch.no_grad():
         mask = torch.ones_like(gates[:, 0])
         out = []
@@ -139,7 +148,9 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
                      w2: torch.nn.ParameterList,
                      feature_shuffle2: typing.Optional[torch.Tensor], groups2: int, experts2: int,
                      input_cache: torch.Tensor, cumsum_cache: torch.Tensor, bottleneck_group: int, training: bool,
-                     caching: bool, idx: int, norm_power: int, jitter_epsilon: float
+                     caching: bool, idx: int, norm_power: int, jitter_epsilon: float,
+                     pkm_layer: bool, pkm_values: typing.Optional[torch.nn.EmbeddingBag], input_dropout: typing.Optional[torch.nn.Dropout],
+                     query_dropout: typing.Optional[torch.nn.Dropout], value_dropout: typing.Optional[torch.nn.Dropout]
                      ) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     kernel_size = w1.size(2)
     pad = True
@@ -148,7 +159,14 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
             pad = False
             inp = torch.cat([input_cache, inp], -1)
         input_cache = inp[:, :, -kernel_size + 1:].detach()
+    # w0 and w2 = moe params
+    #input projection to (intermediaries * 3)
+    #input dims = batch, features, sequence
+
+    # featues -> intermediate * 3
+    # inp.shape = (batch, features * 3, sequence)
     inp = moe_check(inp, w0, training, jitter_epsilon, feature_shuffle0, groups0, experts0)
+    #split projected tensor into three, each with orig. intermediary size
     depth, scale, shift = inp.chunk(3, 1)
     cum = depth.cumsum(-1)
     if not training and caching:
@@ -158,13 +176,61 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
         cum = cum[:, :, -1:]
         if idx - 1 > kernel_size:
             cumsum_cache = cum.detach()
+    # intermediate * 3 -> intermediate
     inp = TripleNorm.apply(cum / divisor, scale, shift, norm_power)
+    # intermediate -> intermediate * 3
     inp = conv(inp, w1, bottleneck_group, pad)
+    # intermediate * 3 -> intermediate
     inp = TripleNorm.apply(*inp.chunk(3, 1), norm_power)
-    inp = moe_check(inp, w2, training, jitter_epsilon, feature_shuffle2, groups2, experts2)
+    # intermediate -> features
+    if pkm_layer:
+        inp = pkm(inp, pkm_values, input_dropout, query_dropout, value_dropout)
+    else:
+        inp = moe_check(inp, w2, training, jitter_epsilon, feature_shuffle2, groups2, experts2)
     return input_cache, cumsum_cache, inp
 
+def pkm(inp: torch.Tensor, pkm_values, input_dropout, query_dropout, value_dropout):
+    b, t, e, h = *x.shape, self.heads
+    x = input_dropout(x)
 
+    queries = self.to_queries(x)
+    queries = self.norm(queries, mask=input_mask)
+    queries = self.query_dropout(queries)
+
+    queries = queries.chunk(2, dim=-1)
+    queries = torch.stack(queries).reshape(2, b, t, h, -1)
+
+    dots = torch.einsum('pbthd,hnpd->bthpn', queries, self.keys)
+    scores, indices = dots.topk(k=self.topk, dim=-1)
+    scores, indices = map(lambda x: x.chunk(2, dim=3), (scores, indices))
+
+    all_topk = self.topk ** 2
+    shape = (b, t, h, all_topk)
+
+    all_scores = (
+            scores[0][..., :, None] +
+            scores[1][..., None, :]
+    ).reshape(*shape)
+
+    all_indices = (
+            indices[0][..., :, None] * self.num_keys +
+            indices[1][..., None, :]
+    ).reshape(*shape)
+
+    final_topk, final_indices = all_scores.topk(self.topk, dim=-1)
+    value_indices = all_indices.gather(-1, final_indices)
+
+    attn = final_topk.softmax(dim=-1)
+
+    value_indices, attn = map(lambda x: x.reshape(-1, self.topk * h), (value_indices, attn))
+
+    out = values(value_indices, per_sample_weights=attn)
+    out = value_dropout(out)
+    return out.reshape(b, t, e)
+
+# w1 inputs:
+# conv_weight(intermediate, intermediate * 3, ctx.model.conv_kernel_size, ctx.model.bottleneck_group,
+#                              ctx.model.activation_std)
 def conv_weight(in_features: int, out_features: int, kernel_size: int, groups: int, std: float):
     return orthonormal(torch.nn.Conv1d(in_features, out_features, (kernel_size,), groups=groups).weight, 1 / std)
 
@@ -314,8 +380,25 @@ class LinearAttentionCell(torch.nn.Module):
         self.experts0 = ctx.model.experts_in_input
         self.experts2 = ctx.model.experts_in_output
         self.jitter_epsilon = ctx.model.moe_jitter_epsilon
+        self.num_features = ctx.model.features
         self.expert_chunks = ctx.model.expert_chunks
+        self.pkm = ctx.model.pkm.use_pkm
+        self.pkm_layers = ctx.model.pkm.pkm_layer_depths
+        self.input_dropout = ctx.model.pkm.input_dropout
+        self.query_dropout = ctx.model.pkm.query_dropout
+        self.key_dropout = ctx.model.pkm.key_dropout
+        self.pkm_topk = ctx.model.pkm.topk
+        self.pkm_num_keys = ctx.model.pkm.num_keys
+        self.pkm_layer = False
+        self.pkm_heads = ctx.model.pkm.heads
+        self.pkm_dim_head = ctx.model.pkm.dim_head
+        self.pkm_values = None # Will be initialized upon cell copy if layer_num in pkm_layers
+        self.input_dropout = None
+        self.query_dropout = None
+        self.value_dropout = None
         intermediate = int(ctx.model.features * ctx.model.feed_forward_intermediate_factor)
+        # conv_weight params:
+        #   in_features: int, out_features: int, kernel_size: int, groups: int, std: float
         self.w0 = torch.nn.ParameterList(get_moe_param(ctx.model.features, intermediate * 3, self.groups0,
                                                        self.experts0, self.expert_chunks, ctx.model.activation_std))
         self.w1 = conv_weight(intermediate, intermediate * 3, ctx.model.conv_kernel_size, ctx.model.bottleneck_group,
@@ -331,6 +414,31 @@ class LinearAttentionCell(torch.nn.Module):
         else:
             self.feature_shuffle0 = None
             self.feature_shuffle2 = None
+
+    def layer_check(self, layer_num: int):
+        # Method to modify variables according to depth
+        self.layer_num = layer_num
+        if self.pkm:
+            if layer_num + 1 in self.pkm_layers:
+                self.pkm_layer = True
+                self.experts2 = 0
+                dim_query = self.pkm_dim_head * self.pkm_heads
+                intermediate = int(ctx.model.features * ctx.model.feed_forward_intermediate_factor)
+                if dim_query % 2 != 0:
+                    raise ValueError("Invalid PKM dim query. \"model.pkm.dim_head\" * \
+                    \"model.pkm_heads\" must equal a number divisible by two.")
+                if dim_query != intermediate:
+                    self.w1 = conv_weight(intermediate, dim_query * 3,
+                                          ctx.model.conv_kernel_size, ctx.model.bottleneck_group,
+                                          ctx.model.activation_std)
+                self.w2 = torch.nn.ParameterList(torch.zeros(self.pkm_heads,
+                                                             self.pkm_num_keys, 2, self.pkm_dim_head // 2))
+                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** 2, self.num_features, mode='sum')
+                init_(self.w2)
+                init_(self.pkm_values.weight)
+                self.input_dropout = torch.nn.Dropout(self.input_dropout)
+                self.query_dropout = torch.nn.Dropout(self.query_dropout)
+                self.value_dropout = torch.nn.Dropout(self.value_dropout)
 
     def reset_cache(self):
         self._cumsum_cache = torch.zeros([])
@@ -354,12 +462,16 @@ class LinearAttentionCell(torch.nn.Module):
                                                                       self.experts2, self._input_cache,
                                                                       self._cumsum_cache, self.bottleneck_group,
                                                                       self.training, self.caching, self.idx,
-                                                                      self.norm_power, self.jitter_epsilon
+                                                                      self.norm_power, self.jitter_epsilon,
+                                                                      self.pkm_layer, self.pkm_values,
+                                                                      self.input_dropout, self.query_dropout,
+                                                                      self.value_dropout
                                                                       )
         out = out * self.init_scale
         return out
 
-    def momentum(self, init_scale: float, deep: bool):
+    def momentum(self, init_scale: float, deep: bool, layer_num: int):
         out = copy.deepcopy(self) if deep else copy.copy(self)
         out.init_scale = init_scale
+        out.layer_check(layer_num)
         return out
