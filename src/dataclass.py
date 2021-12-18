@@ -55,6 +55,7 @@ class Model(DataClass):
     experts_in_output: int = 0
     moe_jitter_epsilon: float = 0.02
     expert_chunks: int = 1  # Increase it if not all MoE parameters fit onto the GPU
+    pkm: PKM = PKM()
 
 
 class Dataset(DataClass):
