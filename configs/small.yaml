@@ -1,11 +1,14 @@
 model:
-  depth: 32
+  depth: 16
   conv_kernel_size: 11
   weight_shared_blocks: 1
   batch_size: 128
   feed_forward_intermediate_factor: 0.125
+  use_riemann_noise: False
   pkm:
     use_pkm: True
+    heads: 4
+    topk: 1
 optimizer:
   beta2: 0.95
   gradient_accumulation_steps: 1
@@ -15,6 +18,8 @@ optimizer:
     cycle_max_lr: 0.01
 log:
   loss_steps_per_print: 8
+  wandb:
+    model_log_type: all
 dataset:
   num_workers: 4
   file_name: /home/david/sentence_corpus_processed.tensor

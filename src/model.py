@@ -83,8 +83,21 @@ class AuxLoss(torch.autograd.Function):
         inp.mean().backward()
 
 
-def moe(inp: torch.Tensor, expert_weights: torch.nn.ParameterList, training: bool,
-        jitter_epsilon: float, feature_shuffle: torch.Tensor, groups: int, experts: int) -> torch.Tensor:
+def rnoise(params, zero, x):
+    N, c, d = x.shape
+    A, b, alpha, r = params
+    mu = x.sum(1, keepdim=True)
+    mu_mean = mu.sum(dim=(1),keepdim=True)*(1/c)
+    s = mu - mu_mean
+    s = s / torch.abs(s).max()
+    sd = A * s + b
+    s = alpha*sd + (1 - alpha) + 1
+    sigma = s / torch.linalg.vector_norm(s)
+    out = r * sigma * x + r * sigma * zero.repeat(x.shape).normal_()
+    return out
+
+def moe(inp: torch.Tensor, expert_weights: torch.nn.ParameterList, r: typing.Optional[torch.nn.ParameterList], zero: typing.Optional[torch.Tensor], training: bool,
+        jitter_epsilon: float, feature_shuffle: torch.Tensor, groups: int, experts: int, model_noise: bool) -> torch.Tensor:
     *expert_weights, gate = expert_weights
     batch, features, sequence = inp.size()
     tokens = batch * sequence
@@ -93,12 +106,15 @@ def moe(inp: torch.Tensor, expert_weights: torch.nn.ParameterList, training: boo
     # get gates
     if gate.dtype != torch.float32:
         gate = gate.float()
-    inp = inp.transpose(1, 2).reshape(tokens, features)
     input_fp32 = inp.float()
-    if training:
+    if training and model_noise:
+        input_fp32 = rnoise(r, zero, input_fp32)
+    elif training:
         input_fp32 = input_fp32 * (torch.rand_like(input_fp32) * jitter_epsilon + 1)
+    inp = input_fp32.transpose(1, 2).reshape(tokens, features)
+
     #matrix multiplication to find tokens' most similar expert
-    logits = input_fp32.mm(gate)
+    logits = inp.mm(gate)
     gates = F.softmax(logits, dim=1)
 
     # calculate permutation/ assign experts
@@ -134,24 +150,23 @@ def moe(inp: torch.Tensor, expert_weights: torch.nn.ParameterList, training: boo
     return inp
 
 
-def moe_check(inp: torch.Tensor, w: torch.nn.ParameterList, training: bool,
-              jitter_epsilon: float, feature_shuffle: torch.Tensor, groups: int, experts: int) -> torch.Tensor:
+def moe_check(inp: torch.Tensor, w: torch.nn.ParameterList, r: typing.Optional[torch.nn.ParameterList], zero: typing.Optional[torch.Tensor], training: bool,
+              jitter_epsilon: float, feature_shuffle: torch.Tensor, groups: int, experts: int, model_noise: bool) -> torch.Tensor:
     if experts > 0:
-        return moe(inp, w, training, jitter_epsilon, feature_shuffle, groups, experts)
+        return moe(inp, w, r, zero, training, jitter_epsilon, feature_shuffle, groups, experts, model_noise)
     return conv(inp, w[0], groups, False)
 
 
 def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
-                     w0: typing.Union[torch.nn.ParameterList, torch.nn.Parameter],
+                     w0: typing.Union[torch.nn.ParameterList, torch.nn.Parameter], r0: typing.Optional[torch.nn.ParameterList],
                      feature_shuffle0: typing.Optional[torch.Tensor], groups0: int, experts0: int,
-                     w1: typing.Union[torch.Tensor, torch.nn.Parameter],
-                     w2: torch.nn.ParameterList,
+                     w1: torch.Tensor, r1: typing.Optional[torch.nn.ParameterList], w2: torch.nn.ParameterList, zero: typing.Optional[torch.Tensor],
                      feature_shuffle2: typing.Optional[torch.Tensor], groups2: int, experts2: int,
                      input_cache: torch.Tensor, cumsum_cache: torch.Tensor, bottleneck_group: int, training: bool,
                      caching: bool, idx: int, norm_power: int, jitter_epsilon: float,
-                     pkm_layer: bool, pkm_values: typing.Optional[torch.nn.EmbeddingBag], input_dropout: typing.Optional[torch.nn.Dropout],
+                     pkm_layer: bool, pkm_keys: torch.nn.Parameter, pkm_values: typing.Optional[torch.nn.EmbeddingBag], input_dropout: typing.Optional[torch.nn.Dropout],
                      query_dropout: typing.Optional[torch.nn.Dropout], value_dropout: typing.Optional[torch.nn.Dropout],
-                     pkm_topk: int, num_keys: int, pkm_heads: int, norm: typing.Optional[torch.nn.BatchNorm1d]
+                     pkm_topk: int, num_keys: int, pkm_heads: int, norm: typing.Optional[torch.nn.BatchNorm1d], model_noise: bool
                      ) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # TODO: Fix kernel_size back to being dynamic
     kernel_size = 7
@@ -167,7 +182,7 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
 
     # featues -> intermediate * 3
     # inp.shape = (batch, features * 3, sequence)
-    inp = moe_check(inp, w0, training, jitter_epsilon, feature_shuffle0, groups0, experts0)
+    inp = moe_check(inp, w0, r0, zero, training, jitter_epsilon, feature_shuffle0, groups0, experts0, model_noise)
     #split projected tensor into three, each with orig. intermediary size
     depth, scale, shift = inp.chunk(3, 1)
     cum = depth.cumsum(-1)
@@ -181,17 +196,17 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
     # intermediate * 3 -> intermediate
     inp = TripleNorm.apply(cum / divisor, scale, shift, norm_power)
     if pkm_layer:
-        inp = pkm(inp, w1, w2, pkm_values, input_dropout, query_dropout, value_dropout, pkm_topk, num_keys, pkm_heads, norm)
+        inp = conv(inp, w1, groups2, True)
+        inp = inp.transpose(2,1)
+        inp = pkm(inp, w2, pkm_keys, pkm_values, input_dropout, query_dropout, value_dropout, pkm_topk, num_keys, pkm_heads, norm)
+        inp = inp.transpose(2,1)
     else:
         # intermediate -> intermediate * 3
         inp = conv(inp, w1, bottleneck_group, pad)
-        print('moe post-conv shape: '+str(inp.shape))
         # intermediate * 3 -> intermediate
         inp = TripleNorm.apply(*inp.chunk(3, 1), norm_power)
-        print('moe post-triple norm shape: ' + str(inp.shape))
         # intermediate -> features
-        inp = moe_check(inp, w2, training, jitter_epsilon, feature_shuffle2, groups2, experts2)
-        print('moe out shape= '+str(inp.shape))
+        inp = moe_check(inp, w2, r1, zero, training, jitter_epsilon, feature_shuffle2, groups2, experts2, False)
     return input_cache, cumsum_cache, inp
 
 def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Parameter,
@@ -199,19 +214,14 @@ def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Pa
         query_dropout:torch.nn.Dropout, value_dropout: torch.nn.Dropout, pkm_topk: int,
         num_keys: int, heads: int, norm: torch.nn.BatchNorm1d):
     b, t, e, h = *inp.shape, heads
-    print(inp.shape)
     inp = input_dropout(inp)
-    print(to_queries.shape)
     queries = F.linear(inp,to_queries)
-    print(queries.shape)
     queries = norm(queries)
     queries = query_dropout(queries)
 
     queries = queries.chunk(2, dim=-1)
     queries = torch.stack(queries).reshape(2, b, t, h, -1)
 
-    print(queries.shape)
-    print(pkm_keys.shape)
     dots = torch.einsum('pbthd,hnpd->bthpn', queries, pkm_keys)
     scores, indices = dots.topk(k=pkm_topk, dim=-1)
     scores, indices = map(lambda x: x.chunk(2, dim=3), (scores, indices))
@@ -238,7 +248,6 @@ def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Pa
 
     out = pkm_values(value_indices, per_sample_weights=attn)
     out = value_dropout(out)
-    print(out.shape)
     return out.reshape(b, t, e)
 
 # w1 inputs:
@@ -392,6 +401,13 @@ class ParameterStore(torch.nn.Module):
         return (f'{self.__class__.__name__}(shape={str(list(self.param.size()))}, device={self.param.device}, '
                 f'dtype={self.param.dtype})')
 
+def get_riemann_noise_params(size):
+    params = []
+    params.append(torch.nn.Parameter(torch.rand(1, size)))
+    params.append(torch.nn.Parameter(torch.rand(1, )))
+    params.append(torch.nn.Parameter(torch.rand(1, )))
+    params.append(torch.nn.Parameter(torch.rand(1, )))
+    return torch.nn.ParameterList(params)
 
 def get_moe_param(in_features: int, out_features: int, groups: int, experts: int, expert_chunks: int, std: float
                   ) -> typing.List[torch.nn.Parameter]:
@@ -432,11 +448,13 @@ class LinearAttentionCell(torch.nn.Module):
         self.pkm_layer = False
         self.pkm_heads = ctx.model.pkm.heads
         self.pkm_dim_head = ctx.model.pkm.dim_head
+        self.pkm_keys = None
         self.pkm_values = None # Will be initialized upon cell copy if layer_num in pkm_layers
         self.norm = None
         self.input_dropout = ctx.model.pkm.input_dropout
         self.query_dropout = ctx.model.pkm.query_dropout
         self.value_dropout = ctx.model.pkm.value_dropout
+        self.model_noise = ctx.model.use_riemann_noise
         intermediate = int(ctx.model.features * ctx.model.feed_forward_intermediate_factor)
         # conv_weight params:
         #   in_features: int, out_features: int, kernel_size: int, groups: int, std: float
@@ -444,6 +462,14 @@ class LinearAttentionCell(torch.nn.Module):
                                                        self.experts0, self.expert_chunks, ctx.model.activation_std))
         self.w1 = conv_weight(intermediate, intermediate * 3, ctx.model.conv_kernel_size, ctx.model.bottleneck_group,
                               ctx.model.activation_std)
+        if ctx.model.use_riemann_noise:
+            self.r0 = get_riemann_noise_params(ctx.model.features)
+            self.r1 = get_riemann_noise_params(ctx.model.features)
+            self.zero_holder = torch.Tensor([0]).to(torch.device('cuda'))
+        else:
+            self.r0 = None
+            self.r1 = None
+            self.zero_holder = None
         self.w2 = torch.nn.ParameterList(get_moe_param(intermediate, ctx.model.features, self.groups2,
                                                        self.experts2, self.expert_chunks, 1))
         self.idx: int = 0
@@ -468,19 +494,17 @@ class LinearAttentionCell(torch.nn.Module):
                 if dim_query % 2 != 0:
                     raise ValueError("Invalid PKM dim query. \"model.pkm.dim_head\" * \
                     \"model.pkm_heads\" must equal a number divisible by two.")
-                if dim_query != intermediate:
-                    # Redefine self.w1 if  pkm query size * 3 doesn't match w/ the current conv/norm op
-                    # self.w1 == "to_queries"
-                    #                                           dim     (dim_head * heads)
-                    self.w1 = torch.nn.Parameter(torch.normal(torch.zeros(dim_query, self.num_features),torch.ones(dim_query, self.num_features)))
-                print(str(dim_query)+' '+str(intermediate))
+                self.w1 = conv_weight(intermediate, self.num_features, self.kernel_size,
+                                      self.groups2, self.activation_std)
+                self.w2 = torch.nn.Parameter(torch.normal(torch.zeros(dim_query, self.num_features),
+                                                          torch.ones(dim_query, self.num_features)))
                 # w2 == "keys"
-                self.w2 = torch.nn.Parameter(torch.zeros(self.pkm_heads,
+                self.pkm_keys = torch.nn.Parameter(torch.zeros(self.pkm_heads,
                                                              self.pkm_num_keys, 2, self.pkm_dim_head // 2))
-                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** 2, self.num_features, mode='sum')
+                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** 2, self.num_features, mode='sum', sparse=True)
                 # Use MaskedBatchNorm1D if using mask objective
-                self.norm = torch.nn.BatchNorm1d(dim_query)
-                init_(self.w2)
+                self.norm = torch.nn.BatchNorm1d(self.num_features)
+                init_(self.pkm_keys)
                 init_(self.pkm_values.weight)
                 self.input_dropout = torch.nn.Dropout(self.input_dropout)
                 self.query_dropout = torch.nn.Dropout(self.query_dropout)
@@ -501,18 +525,18 @@ class LinearAttentionCell(torch.nn.Module):
             self.idx = inp.size(2)
             div = torch.arange(self.idx, device=inp.device).view(1, 1, -1) + 1
         self._input_cache, self._cumsum_cache, out = linear_attention(inp, div,
-                                                                      self.w0, self.feature_shuffle0, self.groups0,
+                                                                      self.w0, self.r0, self.feature_shuffle0, self.groups0,
                                                                       self.experts0,
-                                                                      self.w1,
-                                                                      self.w2, self.feature_shuffle2, self.groups2,
+                                                                      self.w1, self.r1,
+                                                                      self.w2, self.zero_holder, self.feature_shuffle2, self.groups2,
                                                                       self.experts2, self._input_cache,
                                                                       self._cumsum_cache, self.bottleneck_group,
                                                                       self.training, self.caching, self.idx,
                                                                       self.norm_power, self.jitter_epsilon,
-                                                                      self.pkm_layer, self.pkm_values,
+                                                                      self.pkm_layer, self.pkm_keys, self.pkm_values,
                                                                       self.input_dropout, self.query_dropout,
                                                                       self.value_dropout, self.pkm_topk, self.pkm_num_keys, self.pkm_heads,
-                                                                      self.norm
+                                                                      self.norm, self.model_noise
                                                                       )
         out = out * self.init_scale
         return out

@@ -3,6 +3,7 @@ import typing
 
 import argh
 import yaml
+import torch
 
 from src.dataclass import Context
 from src.executable.inference import inference_cli
@@ -46,7 +47,17 @@ def train(config_path: typing.Optional[str] = None, steps: int = 0, load_model: 
 
     dump = yaml.dump(ctx.serialize(), indent=4)
     syntax_print(dump, "yaml", title="Config")
-
+    '''
+    with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('tensorboard_trace')) as prof:
+        train_model(ctx, 128)
+    print(prof.key_averages().table(
+        sort_by="self_cuda_time_total", row_limit=-1))
+    '''
     train_model(ctx, steps, load_model)
 
 
