@@ -219,10 +219,9 @@ def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Pa
     queries = norm(queries)
     queries = query_dropout(queries)
 
-    queries = queries.chunk(2, dim=-1)
-    queries = torch.stack(queries).reshape(2, b, t, h, -1)
+    queries = queries.view(b, t, 2, e*(h//2)).view(b, t, 2, h, -1)
 
-    dots = torch.einsum('pbthd,hnpd->bthpn', queries, pkm_keys)
+    dots = torch.einsum('btphd,hnpd->bthpn', queries, pkm_keys)
     scores, indices = dots.topk(k=pkm_topk, dim=-1)
     scores, indices = map(lambda x: x.chunk(2, dim=3), (scores, indices))
 
@@ -501,7 +500,7 @@ class LinearAttentionCell(torch.nn.Module):
                 # w2 == "keys"
                 self.pkm_keys = torch.nn.Parameter(torch.zeros(self.pkm_heads,
                                                              self.pkm_num_keys, 2, self.pkm_dim_head // 2))
-                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** 2, self.num_features, mode='sum', sparse=True)
+                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** 2, self.num_features, mode='sum')
                 # Use MaskedBatchNorm1D if using mask objective
                 self.norm = torch.nn.BatchNorm1d(self.num_features)
                 init_(self.pkm_keys)
