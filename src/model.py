@@ -212,41 +212,27 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
 def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Parameter,
         pkm_values: torch.nn.EmbeddingBag, input_dropout: torch.nn.Dropout,
         query_dropout:torch.nn.Dropout, value_dropout: torch.nn.Dropout, pkm_topk: int,
-        num_keys: int, heads: int, norm: torch.nn.BatchNorm1d):
+        num_keys: int, heads: int, norm: torch.nn.BatchNorm1d, splits: int = 2):  # add this as a param later on
     b, t, e, h = *inp.shape, heads
     inp = input_dropout(inp)
     queries = F.linear(inp,to_queries)
     queries = norm(queries)
     queries = query_dropout(queries)
+    
+    queries = queries.view(b, t, h, -1, 2)
+    assignment = torch.einsum('bthdp,hnpd->bthpn', queries, pkm_keys)
+    assignment = assignment - assignment.max((-2, -1)).values
+    assignment = assignment.exp()
+    normalizer = dots.sum(-1).prod(-1)
+    scores, indices = dots.max(-2)
+    attn = scores.sum(-1) / normalizer
+    
+    indices = indices * num_keys ** torch.arange(splits, device=indices.device, dtype=indices.dtype).view(1, 1, 1, -1)
+    indices = indices.sum(-1)
+    
+    indices, attn = map(lambda x: x.reshape(-1, h), (indices, attn))
 
-    queries = queries.chunk(2, dim=-1)
-    queries = torch.stack(queries).reshape(2, b, t, h, -1)
-
-    dots = torch.einsum('pbthd,hnpd->bthpn', queries, pkm_keys)
-    scores, indices = dots.topk(k=pkm_topk, dim=-1)
-    scores, indices = map(lambda x: x.chunk(2, dim=3), (scores, indices))
-
-    all_topk = pkm_topk ** 2
-    shape = (b, t, h, all_topk)
-
-    all_scores = (
-            scores[0][..., :, None] +
-            scores[1][..., None, :]
-    ).reshape(*shape)
-
-    all_indices = (
-            indices[0][..., :, None] * num_keys +
-            indices[1][..., None, :]
-    ).reshape(*shape)
-
-    final_topk, final_indices = all_scores.topk(pkm_topk, dim=-1)
-    value_indices = all_indices.gather(-1, final_indices)
-
-    attn = final_topk.softmax(dim=-1)
-
-    value_indices, attn = map(lambda x: x.reshape(-1, pkm_topk * h), (value_indices, attn))
-
-    out = pkm_values(value_indices, per_sample_weights=attn)
+    out = pkm_values(indices, per_sample_weights=attn)
     out = value_dropout(out)
     return out.reshape(b, t, e)
 
