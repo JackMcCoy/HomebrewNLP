@@ -233,6 +233,7 @@ def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Pa
     indices, attn = map(lambda x: x.reshape(-1, h), (indices, attn))
 
     out = pkm_values(indices, per_sample_weights=attn)
+
     out = value_dropout(out)
     return out.reshape(b, t, e)
 
@@ -487,7 +488,7 @@ class LinearAttentionCell(torch.nn.Module):
                 # w2 == "keys"
                 self.pkm_keys = torch.nn.Parameter(torch.zeros(self.pkm_heads,
                                                              self.pkm_num_keys, 2, self.pkm_dim_head // 2))
-                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** 2, self.num_features, mode='sum', sparse=True)
+                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** 2, self.num_features, mode='sum')
                 # Use MaskedBatchNorm1D if using mask objective
                 self.norm = torch.nn.BatchNorm1d(self.num_features)
                 init_(self.pkm_keys)

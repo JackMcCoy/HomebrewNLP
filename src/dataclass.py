@@ -70,8 +70,8 @@ class Dataset(DataClass):
 class WandB(DataClass):
     project: str = 'gpt'
     entity: str = 'homebrewnlp'
-    model_log_type: typing.Optional[str] = None  # One of "gradients", "parameters", "all", or None
-    log_frequency: int = 1000  # log gradients and parameters every N batches
+    model_log_type: typing.Optional[str] = all  # One of "gradients", "parameters", "all", or None
+    log_frequency: int = 16  # log gradients and parameters every N batches
 
 
 class Log(DataClass):
