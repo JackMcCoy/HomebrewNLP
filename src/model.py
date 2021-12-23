@@ -166,7 +166,8 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
                      caching: bool, idx: int, norm_power: int, jitter_epsilon: float,
                      pkm_layer: bool, pkm_keys: torch.nn.Parameter, pkm_values: typing.Optional[torch.nn.EmbeddingBag], input_dropout: typing.Optional[torch.nn.Dropout],
                      query_dropout: typing.Optional[torch.nn.Dropout], value_dropout: typing.Optional[torch.nn.Dropout],
-                     pkm_topk: int, num_keys: int, pkm_heads: int, norm: typing.Optional[torch.nn.BatchNorm1d], model_noise: bool
+                     pkm_topk: int, num_keys: int, pkm_heads: int, norm: typing.Optional[torch.nn.BatchNorm1d], model_noise: bool,
+                     markers: typing.Optional[torch.Tensor], splits: int
                      ) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # TODO: Fix kernel_size back to being dynamic
     kernel_size = 7
@@ -198,7 +199,7 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
     if pkm_layer:
         inp = conv(inp, w1, groups2, True)
         inp = inp.transpose(2,1)
-        inp = pkm(inp, w2, pkm_keys, pkm_values, input_dropout, query_dropout, value_dropout, pkm_topk, num_keys, pkm_heads, norm)
+        inp = pkm(inp, w2, pkm_keys, pkm_values, input_dropout, query_dropout, value_dropout, pkm_topk, num_keys, pkm_heads, norm, markers, splits=splits)
         inp = inp.transpose(2,1)
     else:
         # intermediate -> intermediate * 3
@@ -212,7 +213,7 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
 def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Parameter,
         pkm_values: torch.nn.EmbeddingBag, input_dropout: torch.nn.Dropout,
         query_dropout:torch.nn.Dropout, value_dropout: torch.nn.Dropout, pkm_topk: int,
-        num_keys: int, heads: int, norm: torch.nn.BatchNorm1d, splits: int = 2):  # add this as a param later on
+        num_keys: int, heads: int, norm: torch.nn.BatchNorm1d, markers: torch.Tensor, splits: int = 2):
     b, t, e, h = *inp.shape, heads
     inp = input_dropout(inp)
     queries = F.linear(inp,to_queries)
@@ -221,13 +222,13 @@ def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Pa
     
     queries = queries.view(b, t, h, -1, 2)
     assignment = torch.einsum('bthdp,hnpd->bthpn', queries, pkm_keys)
-    assignment = assignment - assignment.max((-2, -1)).values
+    assignment = assignment - assignment.amax((-2, -1), keepdim=True)
     assignment = assignment.exp()
-    normalizer = dots.sum(-1).prod(-1)
-    scores, indices = dots.max(-2)
+    normalizer = assignment.sum(-1).prod(-1)
+    scores, indices = assignment.max(-2)
     attn = scores.sum(-1) / normalizer
-    
-    indices = indices * num_keys ** torch.arange(splits, device=indices.device, dtype=indices.dtype).view(1, 1, 1, -1)
+
+    indices = indices * num_keys ** markers
     indices = indices.sum(-1)
     
     indices, attn = map(lambda x: x.reshape(-1, h), (indices, attn))
@@ -413,6 +414,7 @@ class LinearAttentionCell(torch.nn.Module):
         self.divisor = lambda: base.divisor
         self.init_scale = init_scale
         self.caching = ctx.eval.cache
+        self.device = ctx.model.device
         self.kernel_size = ctx.model.conv_kernel_size
         self.bottleneck_group = ctx.model.bottleneck_group
         self.norm_power = ctx.model.norm_power
@@ -430,6 +432,7 @@ class LinearAttentionCell(torch.nn.Module):
         self.input_dropout = ctx.model.pkm.input_dropout
         self.query_dropout = ctx.model.pkm.query_dropout
         self.value_dropout = ctx.model.pkm.value_dropout
+        self.splits = ctx.model.pkm.splits
         self.pkm_topk = ctx.model.pkm.topk
         self.pkm_num_keys = ctx.model.pkm.num_keys
         self.pkm_layer = False
@@ -438,6 +441,7 @@ class LinearAttentionCell(torch.nn.Module):
         self.pkm_keys = None
         self.pkm_values = None # Will be initialized upon cell copy if layer_num in pkm_layers
         self.norm = None
+        self.markers = None
         self.input_dropout = ctx.model.pkm.input_dropout
         self.query_dropout = ctx.model.pkm.query_dropout
         self.value_dropout = ctx.model.pkm.value_dropout
@@ -487,10 +491,11 @@ class LinearAttentionCell(torch.nn.Module):
                                                           torch.ones(dim_query, self.num_features)))
                 # w2 == "keys"
                 self.pkm_keys = torch.nn.Parameter(torch.zeros(self.pkm_heads,
-                                                             self.pkm_num_keys, 2, self.pkm_dim_head // 2))
-                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** 2, self.num_features, mode='sum')
+                                                             self.pkm_num_keys, self.splits, self.pkm_dim_head // self.splits))
+                self.pkm_values = torch.nn.EmbeddingBag(self.pkm_num_keys ** self.splits, self.num_features, mode='sum')
                 # Use MaskedBatchNorm1D if using mask objective
                 self.norm = torch.nn.BatchNorm1d(self.num_features)
+                self.markers = torch.arange(self.splits, device=self.device).view(-1, 1).expand(-1, self.pkm_num_keys//self.splits).reshape((1, 1, 1, -1))
                 init_(self.pkm_keys)
                 init_(self.pkm_values.weight)
                 self.input_dropout = torch.nn.Dropout(self.input_dropout)
@@ -523,7 +528,7 @@ class LinearAttentionCell(torch.nn.Module):
                                                                       self.pkm_layer, self.pkm_keys, self.pkm_values,
                                                                       self.input_dropout, self.query_dropout,
                                                                       self.value_dropout, self.pkm_topk, self.pkm_num_keys, self.pkm_heads,
-                                                                      self.norm, self.model_noise
+                                                                      self.norm, self.model_noise, self.markers, self.splits
                                                                       )
         out = out * self.init_scale
         return out

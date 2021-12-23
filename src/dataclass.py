@@ -27,6 +27,7 @@ class PKM(DataClass):
     heads: int = 4
     dim_head: int = 256
     num_keys: int = 128
+    splits: int = 2
 
 class Model(DataClass):
     weight_sharing: bool = False
