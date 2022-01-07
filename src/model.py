@@ -86,15 +86,19 @@ class AuxLoss(torch.autograd.Function):
 def rnoise(params, zero, x):
     N, c, d = x.shape
     A, b, alpha, r = params
-    mu = x.sum(1, keepdim=True)
-    mu_mean = mu.sum(dim=(1),keepdim=True)*(1/c)
-    s = mu - mu_mean
-    s = s / torch.abs(s).max()
-    sd = A * s + b
-    s = alpha*sd + (1 - alpha) + 1
-    sigma = s / torch.linalg.vector_norm(s)
-    out = r * sigma * x + r * sigma * zero.repeat(x.shape).normal_()
-    return out
+
+    s = torch.sum(x, dim=1, keepdim=True)
+    s = s - s.mean(dim=(2), keepdim=True)
+    s_max = s.abs().amax(dim=(2), keepdim=True)
+    s = s / (s_max + 1e-8)
+    s = (s + 1) / 2
+    s = s * A + b
+    s = torch.tile(s, (1, c, 1))
+    sp_att_mask = (1 - alpha) + alpha * s
+    sp_att_mask = sp_att_mask / (torch.linalg.norm(sp_att_mask, dim=1, keepdims=True) + 1e-8)
+
+    x = r * sp_att_mask * x + r * sp_att_mask * (zero.repeat(N, c, d).normal_())
+    return x
 
 def moe(inp: torch.Tensor, expert_weights: torch.nn.ParameterList, r: typing.Optional[torch.nn.ParameterList], zero: typing.Optional[torch.Tensor], training: bool,
         jitter_epsilon: float, feature_shuffle: torch.Tensor, groups: int, experts: int, model_noise: bool) -> torch.Tensor:
@@ -226,7 +230,7 @@ def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Pa
     assignment = assignment.exp()
     normalizer = assignment.sum(-1).prod(-1)
     scores, indices = assignment.max(-2)
-    attn = scores.sum(-1) / normalizer
+    attn = scores.prod(-1) / normalizer
 
     indices = indices * num_keys ** markers
     indices = indices.sum(-1)

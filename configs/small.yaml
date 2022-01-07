@@ -4,7 +4,7 @@ model:
   weight_shared_blocks: 1
   batch_size: 128
   feed_forward_intermediate_factor: 0.125
-  use_riemann_noise: False
+  use_riemann_noise: True
   pkm:
     use_pkm: True
     heads: 4
