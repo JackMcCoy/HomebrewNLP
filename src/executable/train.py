@@ -5,6 +5,7 @@ from src.dataclass import Context
 from src.dataset import get_dataset
 from src.utils.formatting import WandbLog
 from src.utils.setup import get_model
+from src.executable.inference import complete
 
 
 def train_model(ctx: Context, steps=None, load_model: bool = False):
@@ -50,7 +51,11 @@ def train_model(ctx: Context, steps=None, load_model: bool = False):
             p['betas'] = p['betas'][0], mod.ctx.optimizer.beta2
         with torch.no_grad():
             if mod.ctx.log.loss_steps_per_print and i % mod.ctx.log.loss_steps_per_print == 0:
-                log(mean_loss, mean_max_loss,
+                sample_completion = ''
+                if mod.ctx.log.sample_completion_stmt != '':
+                    sample_completion = complete(
+                        ctx, mod, mod.ctx.log.sample_completion_stmt, .5, mod.ctx.log.sample_seq_len)
+                log(sample_completion, mean_loss, mean_max_loss,
                     mod.optimizer.param_groups[0]['lr'], mod.optimizer.param_groups[0]['betas'])
                 mean_loss.zero_()
                 mean_max_loss.zero_()

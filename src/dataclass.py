@@ -78,6 +78,8 @@ class WandB(DataClass):
 class Log(DataClass):
     loss_steps_per_print: int = 32  # 0 -> off
     wandb: WandB = WandB()
+    sample_completion_stmt: str = ''
+    sample_seq_len: int = 512
 
 
 class Offload(DataClass):

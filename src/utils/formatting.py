@@ -42,7 +42,7 @@ class WandbLog:
         self.prev = 0
         self.steps = steps
 
-    def __call__(self, current_loss: torch.Tensor, max_loss: torch.Tensor, learning_rate: float,
+    def __call__(self, sample_completion: str, current_loss: torch.Tensor, max_loss: torch.Tensor, learning_rate: float,
                  betas: typing.Tuple[float, float]):
         grad_accum = self.ctx.optimizer.gradient_accumulation_steps
         curr_loss = current_loss.item() / self.ctx.log.loss_steps_per_print / grad_accum
@@ -64,16 +64,22 @@ class WandbLog:
                      f"Batch/s: {rate:6.3f} -",
                      f"Tokens/day: {tokens_per_day:11,.0f}")
 
+
         if not self.ctx.optimizer.sharpness_aware_minimization.enabled:
             curr_max_loss = None
             mean_max = None
-        wandb.log({"Loss/Current": curr_loss,
-                   "Loss/Mean": self.mean_loss,
-                   "Loss/Current Max": curr_max_loss,
-                   "Loss/Mean Max": mean_max,
-                   "Speed/Batches per Second": rate,
-                   "Speed/Tokens per Day": tokens_per_day,
-                   "Optimizer/Learning Rate": learning_rate,
-                   "Optimizer/Beta1": betas[0],
-                   "Optimizer/Beta2": betas[1]},
-                  step=self.idx * self.ctx.log.loss_steps_per_print)
+        metrics = {"Loss/Current": curr_loss,
+         "Loss/Mean": self.mean_loss,
+         "Loss/Current Max": curr_max_loss,
+         "Loss/Mean Max": mean_max,
+         "Speed/Batches per Second": rate,
+         "Speed/Tokens per Day": tokens_per_day,
+         "Optimizer/Learning Rate": learning_rate,
+         "Optimizer/Beta1": betas[0],
+         "Optimizer/Beta2": betas[1]}
+
+        if sample_completion != '':
+            pretty_print(f"Sample output: {sample_completion}")
+            metrics['Sample'] = sample_completion
+
+        wandb.log(metrics,step=self.idx * self.ctx.log.loss_steps_per_print)
