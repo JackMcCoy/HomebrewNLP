@@ -80,6 +80,7 @@ class Log(DataClass):
     wandb: WandB = WandB()
     sample_completion_stmt: str = ''
     sample_seq_len: int = 512
+    sample_temp: float = .1
 
 
 class Offload(DataClass):

@@ -111,7 +111,7 @@ def moe(inp: torch.Tensor, expert_weights: torch.nn.ParameterList, r: typing.Opt
     if gate.dtype != torch.float32:
         gate = gate.float()
     input_fp32 = inp.float()
-    if training and model_noise:
+    if model_noise:
         input_fp32 = rnoise(r, zero, input_fp32)
     elif training:
         input_fp32 = input_fp32 * (torch.rand_like(input_fp32) * jitter_epsilon + 1)
@@ -168,7 +168,8 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
                      feature_shuffle2: typing.Optional[torch.Tensor], groups2: int, experts2: int,
                      input_cache: torch.Tensor, cumsum_cache: torch.Tensor, bottleneck_group: int, training: bool,
                      caching: bool, idx: int, norm_power: int, jitter_epsilon: float,
-                     pkm_layer: bool, pkm_keys: torch.nn.Parameter, pkm_values: typing.Optional[torch.nn.EmbeddingBag], input_dropout: typing.Optional[torch.nn.Dropout],
+                     pkm_layer: bool, pkm_keys: torch.nn.Parameter, pkm_values: typing.Optional[torch.nn.EmbeddingBag],
+                     pkm_bias: typing.Optional[torch.nn.Parameter], input_dropout: typing.Optional[torch.nn.Dropout],
                      query_dropout: typing.Optional[torch.nn.Dropout], value_dropout: typing.Optional[torch.nn.Dropout],
                      pkm_topk: int, num_keys: int, pkm_heads: int, norm: typing.Optional[torch.nn.BatchNorm1d], model_noise: bool,
                      markers: typing.Optional[torch.Tensor], splits: int
@@ -203,7 +204,7 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
     if pkm_layer:
         inp = conv(inp, w1, groups2, True)
         inp = inp.transpose(2,1)
-        inp = pkm(inp, w2, pkm_keys, pkm_values, input_dropout, query_dropout, value_dropout, pkm_topk, num_keys, pkm_heads, norm, markers, splits=splits)
+        inp = pkm(inp, w2, pkm_bias, pkm_keys, pkm_values, input_dropout, query_dropout, value_dropout, pkm_topk, num_keys, pkm_heads, norm, markers, splits=splits)
         inp = inp.transpose(2,1)
     else:
         # intermediate -> intermediate * 3
@@ -214,13 +215,14 @@ def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
         inp = moe_check(inp, w2, r1, zero, training, jitter_epsilon, feature_shuffle2, groups2, experts2, False)
     return input_cache, cumsum_cache, inp
 
-def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_keys: torch.nn.Parameter,
+def pkm(inp: torch.Tensor, to_queries: torch.nn.Parameter, pkm_bias: torch.nn.Parameter(), pkm_keys: torch.nn.Parameter,
         pkm_values: torch.nn.EmbeddingBag, input_dropout: torch.nn.Dropout,
         query_dropout:torch.nn.Dropout, value_dropout: torch.nn.Dropout, pkm_topk: int,
         num_keys: int, heads: int, norm: torch.nn.BatchNorm1d, markers: torch.Tensor, splits: int = 2):
     b, t, e, h = *inp.shape, heads
     inp = input_dropout(inp)
     queries = F.linear(inp,to_queries)
+    queries = queries+pkm_bias
     queries = norm(queries)
     queries = query_dropout(queries)
     
@@ -440,6 +442,7 @@ class LinearAttentionCell(torch.nn.Module):
         self.pkm_topk = ctx.model.pkm.topk
         self.pkm_num_keys = ctx.model.pkm.num_keys
         self.pkm_layer = False
+        self.pkm_bias = None
         self.pkm_heads = ctx.model.pkm.heads
         self.pkm_dim_head = ctx.model.pkm.dim_head
         self.pkm_keys = None
@@ -493,6 +496,7 @@ class LinearAttentionCell(torch.nn.Module):
                                       self.groups2, self.activation_std)
                 self.w2 = torch.nn.Parameter(torch.normal(torch.zeros(dim_query, self.num_features),
                                                           torch.ones(dim_query, self.num_features)))
+                self.pkm_bias = torch.nn.Parameter(torch.nn.init.constant_(torch.ones(dim_query, ), 0))
                 # w2 == "keys"
                 self.pkm_keys = torch.nn.Parameter(torch.zeros(self.pkm_heads,
                                                              self.pkm_num_keys, self.splits, self.pkm_dim_head // self.splits))
@@ -530,6 +534,7 @@ class LinearAttentionCell(torch.nn.Module):
                                                                       self.training, self.caching, self.idx,
                                                                       self.norm_power, self.jitter_epsilon,
                                                                       self.pkm_layer, self.pkm_keys, self.pkm_values,
+                                                                      self.pkm_bias,
                                                                       self.input_dropout, self.query_dropout,
                                                                       self.value_dropout, self.pkm_topk, self.pkm_num_keys, self.pkm_heads,
                                                                       self.norm, self.model_noise, self.markers, self.splits

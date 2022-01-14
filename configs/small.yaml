@@ -1,10 +1,12 @@
 model:
-  depth: 16
+  features: 256
+  sequence_length: 256
+  depth: 32
   conv_kernel_size: 11
   weight_shared_blocks: 1
   batch_size: 128
   feed_forward_intermediate_factor: 0.125
-  use_riemann_noise: True
+  use_riemann_noise: False
   pkm:
     use_pkm: True
     heads: 4
@@ -20,6 +22,8 @@ log:
   loss_steps_per_print: 8
   wandb:
     model_log_type: all
+  sample_completion_stmt: Andrew Cuomo  
+  sample_temp: .4
 dataset:
   num_workers: 4
   file_name: /home/david/sentence_corpus_processed.tensor

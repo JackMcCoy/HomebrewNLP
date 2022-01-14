@@ -54,7 +54,7 @@ def train_model(ctx: Context, steps=None, load_model: bool = False):
                 sample_completion = ''
                 if mod.ctx.log.sample_completion_stmt != '':
                     sample_completion = complete(
-                        ctx, mod, mod.ctx.log.sample_completion_stmt, .5, mod.ctx.log.sample_seq_len)
+                        ctx, mod.model, mod.ctx.log.sample_completion_stmt, mod.ctx.log.sample_temp, 256)
                 log(sample_completion, mean_loss, mean_max_loss,
                     mod.optimizer.param_groups[0]['lr'], mod.optimizer.param_groups[0]['betas'])
                 mean_loss.zero_()

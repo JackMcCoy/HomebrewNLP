@@ -80,6 +80,6 @@ class WandbLog:
 
         if sample_completion != '':
             pretty_print(f"Sample output: {sample_completion}")
-            metrics['Sample'] = sample_completion
+            metrics['Sample'] = wandb.Table(data=[[sample_completion]], columns=["Text"])
 
         wandb.log(metrics,step=self.idx * self.ctx.log.loss_steps_per_print)
